@@ -105,6 +105,46 @@ class YouTubeLiveSearchService : AccessibilityService() {
         @Volatile
         private var lockedWatchPageTitle: String? = null
 
+        // ---- Video Identity Guard (independent watchdog: target video ke title + channel ko lock karke compare karta hai) ----
+        @Volatile
+        private var guardTargetKey: String? = null
+
+        @Volatile
+        private var guardBaselineTitle: String? = null
+
+        @Volatile
+        private var guardBaselineFromMatch: Boolean = false
+
+        @Volatile
+        private var guardBaselineChannelSig: Set<String> = emptySet()
+
+        @Volatile
+        private var guardPendingTitle: String? = null
+
+        @Volatile
+        private var guardPendingReads: Int = 0
+
+        @Volatile
+        private var guardTitleDiffCount: Int = 0
+
+        @Volatile
+        private var guardChannelDiffCount: Int = 0
+
+        @Volatile
+        private var guardLastFailTime: Long = 0L
+
+        private fun resetVideoGuard() {
+            guardTargetKey = null
+            guardBaselineTitle = null
+            guardBaselineFromMatch = false
+            guardBaselineChannelSig = emptySet()
+            guardPendingTitle = null
+            guardPendingReads = 0
+            guardTitleDiffCount = 0
+            guardChannelDiffCount = 0
+            guardLastFailTime = 0L
+        }
+
         @Volatile
         private var hasTypedCommentText: Boolean = false
 
@@ -259,6 +299,7 @@ class YouTubeLiveSearchService : AccessibilityService() {
             lastCommentCancelClickTime = 0L
             lastCommentRewardTriggerTime = 0L
             wasTargetVideoLikedInSession = false
+            resetVideoGuard()
         }
 
         fun prepareForDirectWatch(title: String, channel: String?, videoUrl: String? = null, videoId: String? = null) {
@@ -359,12 +400,31 @@ class YouTubeLiveSearchService : AccessibilityService() {
     )
     private var backgroundPushSyncJob: kotlinx.coroutines.Job? = null
 
+    // Independent watchdog: har 500ms par check karta hai ki YouTube par abhi wahi target video chal raha hai ya nahi.
+    private val videoGuardHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private val videoGuardRunnable = object : Runnable {
+        override fun run() {
+            try {
+                videoGuardTick()
+            } catch (_: Exception) {}
+            if (isServiceConnected) {
+                videoGuardHandler.postDelayed(this, 500L)
+            }
+        }
+    }
+
+    private fun startVideoIdentityGuard() {
+        videoGuardHandler.removeCallbacks(videoGuardRunnable)
+        videoGuardHandler.postDelayed(videoGuardRunnable, 1000L)
+    }
+
     override fun onServiceConnected() {
         super.onServiceConnected()
         instance = this
         isServiceConnected = true
         WatchSessionRepository.addLog("YouTube Human Live Search Accessibility Service Connected", LogType.INFO)
         startBackgroundAdminPushSync()
+        startVideoIdentityGuard()
     }
 
     private fun startBackgroundAdminPushSync() {
@@ -3355,15 +3415,14 @@ class YouTubeLiveSearchService : AccessibilityService() {
      */
     private fun isCommentSheetOpenOnScreen(entries: List<UiNodeEntry>): Boolean {
         if (isSoftKeyboardVisible()) return true
+        val minSheetHeight = (resources.displayMetrics.heightPixels.coerceAtLeast(800) * 0.30f).toInt()
         return entries.any { e ->
             val v = e.viewId.lowercase()
             val d = e.desc.trim().lowercase()
+            // A real comments / bottom sheet is a BIG container; tiny persistent nodes with such ids don't count.
+            ((v.contains("engagement_panel") || v.contains("bottom_sheet") ||
+                v.contains("comment_thread") || v.contains("comment_sheet")) && e.rect.height() >= minSheetHeight) ||
             (e.isEditable && (v.contains("comment") || v.contains("reply") || v.contains("composer"))) ||
-            v.contains("comment_composer") ||
-            v.contains("comment_thread") ||
-            v.contains("comment_box") ||
-            v.contains("engagement_panel") ||
-            v.contains("bottom_sheet") ||
             d == "close comments" ||
             d == "टिप्पणियां बंद करें" ||
             d.startsWith("reply to ")
@@ -3380,6 +3439,289 @@ class YouTubeLiveSearchService : AccessibilityService() {
             WatchSessionRepository.onRequestHideOverlay?.invoke()
         } catch (_: Exception) {}
         WatchSessionRepository.triggerTaskIncomplete(message)
+    }
+
+    // ======================= VIDEO IDENTITY GUARD =======================
+    // YouTube ka video ID screen / MediaSession par expose nahi hota, isliye identity = (title + channel).
+    // Flow: target video open hote hi uska on-screen title + channel "lock" (baseline) hota hai.
+    // Uske baad har 500ms par watch page ka title/channel padha jata hai; baseline se alag aaya to
+    // overlay hide + Task Incomplete. Ye existing flags (isWatchPlayerConfirmedOpen etc.) par depend nahi karta.
+
+    private data class WatchIdentity(
+        val title: String,
+        val channel: String,
+        val channelSig: Set<String>
+    )
+
+    private fun normForGuard(s: String?): String {
+        if (s.isNullOrBlank()) return ""
+        return s.lowercase()
+            .replace(Regex("[^\\p{L}\\p{M}\\p{N}]+"), " ")
+            .trim()
+    }
+
+    /** True if both strings are the same video title (tolerates truncation "..." and tiny text differences). */
+    private fun isSameVideoTitle(a: String, b: String): Boolean {
+        val na = normForGuard(a)
+        val nb = normForGuard(b)
+        if (na.isEmpty() || nb.isEmpty()) return true
+        if (na == nb) return true
+        val shorter = if (na.length <= nb.length) na else nb
+        val longer = if (na.length <= nb.length) nb else na
+        if (longer.contains(shorter) && shorter.length >= (longer.length * 0.6f).toInt()) return true
+        val ta = na.split(" ").filter { it.isNotEmpty() }.toSet()
+        val tb = nb.split(" ").filter { it.isNotEmpty() }.toSet()
+        if (ta.isEmpty() || tb.isEmpty()) return true
+        val inter = ta.intersect(tb).size.toFloat()
+        val union = ta.union(tb).size.toFloat()
+        return (inter / union) >= 0.8f
+    }
+
+    /** Reads the playing video's title (+ channel row) from the watch page header below the 16:9 player. */
+    private fun readWatchIdentity(
+        entries: List<UiNodeEntry>,
+        playerBottomY: Int,
+        screenHeight: Int,
+        density: Float,
+        targetAuthor: String?
+    ): WatchIdentity? {
+        val subscribeAnchor = entries.firstOrNull { e ->
+            val t = e.text.lowercase()
+            val d = e.desc.lowercase()
+            val v = e.viewId.lowercase()
+            e.rect.top in (playerBottomY - (8 * density).toInt())..(playerBottomY + (220 * density).toInt()) && (
+                t.contains("subscribe") || d.contains("subscribe") || v.contains("subscribe") ||
+                t.contains("सदस्यता") || d.contains("सदस्यता")
+            )
+        }
+        val headerTopY = (playerBottomY - (16 * density).toInt()).coerceAtLeast((screenHeight * 0.15f).toInt())
+        val headerBottomY = (subscribeAnchor?.rect?.top ?: (playerBottomY + (160 * density).toInt()))
+            .coerceAtMost((screenHeight * 0.55f).toInt())
+
+        val sortedHeaderEntries = entries
+            .filter { e ->
+                val vLow = e.viewId.lowercase()
+                val isPlayerControlView = vLow.contains("player") ||
+                        vLow.contains("time_bar") ||
+                        vLow.contains("scrubber") ||
+                        vLow.contains("control") ||
+                        vLow.contains("overlay") ||
+                        vLow.contains("inline") ||
+                        vLow.contains("autonav") ||
+                        vLow.contains("seek") ||
+                        vLow.contains("chapter") ||
+                        vLow.contains("caption") ||
+                        vLow.contains("subtitle") ||
+                        vLow.contains("live_chat") ||
+                        vLow.contains("tooltip") ||
+                        vLow.contains("hint") ||
+                        vLow.contains("comment") ||
+                        vLow.contains("composer") ||
+                        vLow.contains("bottom_sheet") ||
+                        vLow.contains("engagement")
+                !isPlayerControlView &&
+                        e.rect.top in headerTopY..headerBottomY &&
+                        e.rect.height() <= (screenHeight * 0.40f).toInt()
+            }
+            .sortedWith(compareBy<UiNodeEntry> { it.rect.top }.thenByDescending { it.rect.width() })
+
+        val normAuthor = normForGuard(targetAuthor)
+        val skipPrefixes = listOf(
+            "ad ·", "ad •", "sponsored", "skip ad", "like this", "dislike this", "subscribe to",
+            "unsubscribe from", "options for", "save to", "share", "comments", "add a comment",
+            "add a reply", "pinned by", "go to channel"
+        )
+
+        var title: String? = null
+        for (e in sortedHeaderEntries) {
+            for (candidate in listOf(e.text, e.desc)) {
+                val raw = candidate.trim()
+                if (raw.length < 3 || CHROME_LABELS.contains(raw.lowercase())) continue
+                val extracted = extractCleanTitleCandidate(raw)
+                val low = extracted.lowercase()
+                val normTxt = normForGuard(extracted)
+                val isJustChannel = normAuthor.isNotEmpty() &&
+                        (normTxt == normAuthor || normTxt.replace(" ", "") == normAuthor.replace(" ", ""))
+                if (extracted.length >= 4 &&
+                    !isJustChannel &&
+                    !CHROME_LABELS.contains(low) &&
+                    !low.startsWith("@") &&
+                    !low.matches(Regex("^[0-9:\\s/•·.,%-]+$")) &&
+                    skipPrefixes.none { low.startsWith(it) }
+                ) {
+                    title = extracted
+                    break
+                }
+            }
+            if (title != null) break
+        }
+        val foundTitle = title ?: return null
+
+        // Channel row (same row as the Subscribe button)
+        val sig = mutableSetOf<String>()
+        var channelText = ""
+        if (subscribeAnchor != null) {
+            val rowTol = (36 * density).toInt()
+            val channelEntry = entries.firstOrNull { e ->
+                e != subscribeAnchor &&
+                        Math.abs(e.rect.top - subscribeAnchor.rect.top) <= rowTol &&
+                        (e.text.isNotBlank() || e.desc.isNotBlank()) &&
+                        !e.text.contains("subscribe", ignoreCase = true) &&
+                        !e.desc.contains("subscribe", ignoreCase = true) &&
+                        !e.desc.contains("bell", ignoreCase = true)
+            }
+            channelText = channelEntry?.text?.ifBlank { channelEntry.desc }?.trim().orEmpty()
+
+            for (e in entries) {
+                if (e == subscribeAnchor) continue
+                if (Math.abs(e.rect.top - subscribeAnchor.rect.top) > rowTol) continue
+                for (raw in listOf(e.text, e.desc)) {
+                    val s = raw.trim()
+                    val low = s.lowercase()
+                    if (s.length < 2 || CHROME_LABELS.contains(low)) continue
+                    if (low.contains("subscribe") || low.contains("bell") || low.contains("notification") ||
+                        low.contains("go to channel") || low.contains("चैनल पर जाएं") ||
+                        low.contains("verified") || low.contains("सत्यापित")
+                    ) continue
+                    val n = normForGuard(s)
+                    if (n.length >= 2) sig.add(n)
+                }
+            }
+        }
+        return WatchIdentity(foundTitle, channelText, sig)
+    }
+
+    private fun setGuardBaseline(cur: WatchIdentity, fromMatch: Boolean) {
+        guardBaselineTitle = cur.title
+        guardBaselineFromMatch = fromMatch
+        guardBaselineChannelSig = cur.channelSig
+        guardPendingTitle = null
+        guardPendingReads = 0
+        guardTitleDiffCount = 0
+        guardChannelDiffCount = 0
+        WatchSessionRepository.addLog("Video Guard: target video lock hua -> \"${cur.title}\"", LogType.INFO)
+    }
+
+    private fun videoGuardTick() {
+        if (WatchSessionRepository.sessionState.value != com.example.data.SessionState.ACTIVE) return
+        val targetTitle = WatchSessionRepository.targetTaskTitle.value ?: return
+        val targetAuthor = WatchSessionRepository.targetTaskAuthor.value
+        val now = System.currentTimeMillis()
+        if (now - WatchSessionRepository.taskLaunchTimestampMillis < 3500L) return
+        if (now - guardLastFailTime < 5000L) return
+        if (!isYouTubeInForeground) return
+        // Abhi search / target open karne ka kaam chal raha hai -> watch page nahi hai
+        if (currentPhase != LiveSearchPhase.IDLE && currentPhase != LiveSearchPhase.COMPLETED && !hasClickedTarget) return
+        // Fullscreen landscape mein header dikhta nahi
+        if (resources.configuration.orientation == android.content.res.Configuration.ORIENTATION_LANDSCAPE) return
+
+        if (guardTargetKey != targetTitle) {
+            resetVideoGuard()
+            guardTargetKey = targetTitle
+        }
+
+        val root = getYouTubeRootNode() ?: return
+        if (!isFullWatchPlayerScreen(root)) {
+            guardTitleDiffCount = 0
+            guardChannelDiffCount = 0
+            return
+        }
+
+        val entries = mutableListOf<UiNodeEntry>()
+        val allRoots = getAllYouTubeRootNodes(root)
+        if (allRoots.isEmpty()) {
+            collectScreenNodes(root, entries)
+        } else {
+            for (r in allRoots) collectScreenNodes(r, entries)
+        }
+        if (entries.isEmpty()) return
+
+        val screenHeight = resources.displayMetrics.heightPixels.coerceAtLeast(800)
+        val screenWidth = resources.displayMetrics.widthPixels.coerceAtLeast(400)
+        val density = resources.displayMetrics.density
+        val playerBottomY = getStatusBarHeight() + ((screenWidth * 9) / 16)
+
+        // Comments sheet / keyboard khula ho to header dikhta nahi -> koi evidence nahi
+        if (isCommentSheetOpenOnScreen(entries)) return
+
+        // Player ke aas-paas ad chal raha ho to skip (sirf player + header zone dekhte hain, neeche ke feed ke sponsored cards nahi)
+        val adZoneBottom = playerBottomY + (260 * density).toInt()
+        if (isYouTubeAdPlaying(entries.filter { it.rect.top < adZoneBottom })) {
+            guardTitleDiffCount = 0
+            guardChannelDiffCount = 0
+            return
+        }
+
+        val cur = readWatchIdentity(entries, playerBottomY, screenHeight, density, targetAuthor) ?: return
+
+        val isGenericTarget = targetTitle.equals("YouTube Video Task", ignoreCase = true) ||
+                targetTitle.equals("YouTube Video", ignoreCase = true) ||
+                targetTitle.startsWith("YouTube Video (", ignoreCase = true)
+        val mediaArtist = WatchSessionRepository.currentMediaArtist.value
+        val matchRes = if (isGenericTarget) null else TitleMatcher.evaluateMatch(
+            cur.title,
+            targetTitle,
+            cur.channel.takeIf { it.isNotBlank() } ?: mediaArtist,
+            targetAuthor
+        )
+
+        val baseline = guardBaselineTitle
+        if (baseline == null) {
+            // Baseline abhi lock nahi hui
+            when (matchRes) {
+                com.example.data.MatchResult.MATCH -> setGuardBaseline(cur, true)
+                com.example.data.MatchResult.MISMATCH -> guardTitleDiffCount++
+                else -> {
+                    val pending = guardPendingTitle
+                    if (pending != null && isSameVideoTitle(cur.title, pending)) {
+                        guardPendingReads++
+                    } else {
+                        guardPendingTitle = cur.title
+                        guardPendingReads = 1
+                    }
+                    if (guardPendingReads >= 5) setGuardBaseline(cur, false)
+                }
+            }
+        } else {
+            val sameTitle = isSameVideoTitle(cur.title, baseline)
+            if (sameTitle) {
+                guardTitleDiffCount = 0
+                val base = guardBaselineChannelSig
+                if (base.isEmpty() && cur.channelSig.isNotEmpty()) {
+                    guardBaselineChannelSig = cur.channelSig
+                    guardChannelDiffCount = 0
+                } else {
+                    val channelSame = base.isEmpty() || cur.channelSig.isEmpty() || cur.channelSig.any { it in base }
+                    if (channelSame) guardChannelDiffCount = 0 else guardChannelDiffCount++
+                }
+            } else {
+                guardChannelDiffCount = 0
+                if (!guardBaselineFromMatch && matchRes == com.example.data.MatchResult.MATCH) {
+                    setGuardBaseline(cur, true)
+                } else {
+                    guardTitleDiffCount++
+                }
+            }
+        }
+
+        val titleFail = guardTitleDiffCount >= 2
+        val channelFail = guardChannelDiffCount >= 3
+        if (titleFail || channelFail) {
+            guardLastFailTime = now
+            guardTitleDiffCount = 0
+            guardChannelDiffCount = 0
+            WatchSessionRepository.addLog(
+                "Video Guard: video change detect hua. Locked=\"${baseline ?: targetTitle}\" | Ab chal raha=\"${cur.title}\"",
+                LogType.WARNING
+            )
+            failTaskForVideoChange(
+                if (titleFail) {
+                    "Task Incomplete! Target video (\"$targetTitle\") ke bajaye doosra video (\"${cur.title}\") chal raha hai."
+                } else {
+                    "Task Incomplete! Target video ke channel se match nahi hua, doosre channel ka video chal raha hai."
+                }
+            )
+        }
     }
 
     private fun verifyActiveYouTubeVideo(rootNode: AccessibilityNodeInfo?) {
@@ -3779,6 +4121,7 @@ class YouTubeLiveSearchService : AccessibilityService() {
 
     override fun onDestroy() {
         super.onDestroy()
+        videoGuardHandler.removeCallbacks(videoGuardRunnable)
         if (instance == this) {
             instance = null
         }
