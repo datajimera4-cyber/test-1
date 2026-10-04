@@ -1,0 +1,8 @@
+{
+  "name": "Remix my-1",
+  "description": "Imported from GitHub: datajimera7-collab/my-1",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
